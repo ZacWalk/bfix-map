@@ -1,0 +1,15 @@
+[package]
+name = "bfixmap"
+version = "0.1.0"
+edition = "2021"
+
+[[bench]]
+name = "perf"
+harness = false
+
+[dependencies]
+parking_lot = "0.12.3"
+
+[dev-dependencies]
+criterion = "0.5.1"
+rand = "0.8.5"
