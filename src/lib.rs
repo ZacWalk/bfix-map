@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicUsize, Ordering};
 const BLOCK_SIZE: usize = 64;
 const NUM_BLOCKS: usize = 8;
 
-pub struct BFixVec<T> {
+pub struct ShardVec<T> {
     size: AtomicUsize,
     blocks: [AtomicPtr<T>; NUM_BLOCKS],
 }
 
-impl<T: Default> BFixVec<T> {
+impl<T: Default> ShardVec<T> {
     fn new() -> Self {
         Self {
             size: AtomicUsize::new(0),
@@ -108,6 +108,16 @@ impl<T: Default> BFixVec<T> {
         // and blocks are only accessed after they're allocated
         unsafe { &mut *ptr.add(index_in_block) }
     }
+
+    fn get_mut_unchecked_relaxed(&self, index: usize) -> &mut T {
+        let block_index = index / BLOCK_SIZE;
+        let index_in_block = index % BLOCK_SIZE;
+        let ptr = self.blocks[block_index].load(Ordering::Relaxed);
+
+        // Safety: We've checked the index is within bounds,
+        // and blocks are only accessed after they're allocated
+        unsafe { &mut *ptr.add(index_in_block) }
+    }
 }
 
 const SLOT_BITS: usize = 8;
@@ -132,22 +142,103 @@ impl<K: Default, V: Default> Default for Entry<K, V> {
 
 struct Shard<K: Default, V: Default> {
     slots: [AtomicU16; SLOT_COUNT],
-    entries: BFixVec<Entry<K, V>>,
+    entries: ShardVec<Entry<K, V>>,
+    first_free_index: AtomicU16,
 }
 
 impl<K: Default, V: Default> Shard<K, V> {
     fn new() -> Self {
         Self {
             slots: [const { AtomicU16::new(0) }; SLOT_COUNT],
-            entries: BFixVec::new(),
+            entries: ShardVec::new(),
+            first_free_index: AtomicU16::new(0),
         }
     }
 
     fn allocate_entry(&self) -> Option<(usize, &mut Entry<K, V>)> {
+        
+        loop {
+            let first = self.first_free_index.load(Ordering::Acquire);
+
+            if first == 0 {
+                break; // No free entries
+            }
+    
+            let index = (first - 1) as usize; // Convert to 0-based index
+            let entry = self.entries.get_mut_unchecked(index);    
+            let next = entry.next.load(Ordering::Acquire);
+    
+            // Attempt to update the head of the free list
+            if self
+                .first_free_index
+                .compare_exchange_weak(first, next, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some((index, entry));
+            }
+        }
+
+        // none on the free list - allocate
         self.entries.allocate()
     }
 
-    fn free_entry(&self, i: usize) {}
+    fn free_entry(&self, i: usize) {
+        // add to free list
+        loop {
+            let entry = &self.entries.get_unchecked(i);
+            let first = self.first_free_index.load(Ordering::Acquire);
+            entry.next.store(first as u16, Ordering::Release);
+
+            // Remove from slot
+            match self.first_free_index.compare_exchange_weak(
+                first as u16,
+                (i + 1) as u16,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // success
+                    break;
+                }
+                Err(_) => {
+                    // Another thread already inserted. Try again
+                    continue;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn find_index<Q>(&self, slot: usize, key: &Q) -> (Option<usize>, Option<usize>, usize)
+    where
+        K: Borrow<Q> + Eq,
+        Q: Eq + Hash + ?Sized,
+    {
+        let i = self.slots[slot].load(Ordering::Acquire) as usize;
+        let mut prev: Option<usize> = None;
+
+        if i != 0 {
+            let mut ii = i - 1;
+
+            loop {
+                let entry = &self.entries.get_unchecked(ii);
+
+                if entry.key.borrow() == key {
+                    return (Some(ii), prev, i);
+                }
+
+                prev = Some(ii);
+                let next = entry.next.load(Ordering::Acquire);
+
+                if next == 0 {
+                    return (None, prev, i); // not found
+                }
+
+                ii = (next - 1) as usize;
+            }
+        }
+        (None, None, i)
+    }
 }
 
 pub struct BFixMap<K: Default, V: Clone + Default, S = RandomState> {
@@ -178,52 +269,16 @@ fn closest_power_of_2_min_1024(value: usize) -> usize {
     }
 }
 
-#[inline]
-fn find_index<Q, K: Default, V: Default>(
-    bucket: &Shard<K, V>,
-    slot: usize,
-    key: &Q,
-) -> (Option<usize>, Option<usize>, usize)
-where
-    K: Borrow<Q> + Eq,
-    Q: Eq + Hash + ?Sized,
-{
-    let i = bucket.slots[slot].load(Ordering::Acquire) as usize;
-    let mut prev: Option<usize> = None;
-
-    if i != 0 {
-        let mut ii = i - 1;
-
-        loop {
-            let entry = &bucket.entries.get_unchecked(ii);
-
-            if entry.key.borrow() == key {
-                return (Some(ii), prev, i);
-            }
-
-            prev = Some(ii);
-            let next = entry.next.load(Ordering::Acquire);
-
-            if next == 0 {
-                return (None, prev, i); // not found
-            }
-
-            ii = (next - 1) as usize;
-        }
-    }
-    (None, None, i)
-}
-
 /// A concurrent hash map with bucket-level fine-grained locking.
 ///
 /// This map is optimized to provide safe concurrent access for multiple threads, allowing
 /// simultaneous reads and writes without blocking the entire map.
 ///
-/// This map has a naive implementation however it turns out to have very good performance
-/// with large numbers of threads. The trade-off is that the number of buckets is set at
+/// This map has a naive implementation however it turns out to have good performance
+/// with large numbers of threads. The trade-off is that the max number of shards is set at
 /// creation time based on the provided capacity. The collection can grow to contain larger
-/// numbers of items than the specified capacity, but the number of buckets does not change.
-/// This design avoids any complex mechanisms around splitting buckets, reducing lock contention.
+/// numbers of items than the specified capacity, but the number of shards does not change.
+/// This design avoids any complex mechanisms around splitting shards.
 ///
 /// # Type Parameters
 ///
@@ -282,7 +337,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
             let mut ii = i - 1;
 
             loop {
-                let entry = &shard.entries.get_unchecked(ii);
+                let entry = &shard.entries.get_mut_unchecked_relaxed(ii);
 
                 if entry.key.borrow() == key {
                     return Some(entry.value.clone());
@@ -311,7 +366,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         let mut inserted_index: Option<usize> = None;
 
         loop {
-            let (found_index, _, slot_value) = find_index(&shard, slot, &key);
+            let (found_index, _, slot_value) = shard.find_index(slot, &key);
 
             if let Some(index) = found_index {
                 if let Some(i) = inserted_index {
@@ -340,11 +395,11 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
                 .next
                 .store(slot_value as u16, Ordering::Release);
 
-            match shard.slots[slot as usize].compare_exchange(
+            match shard.slots[slot as usize].compare_exchange_weak(
                 slot_value as u16,
                 (inserted_index.unwrap() + 1) as u16,
                 Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     break; // success
@@ -367,21 +422,21 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         let shard = &self.shards[shard_index];
 
         loop {
-            let (found_index, prev_index, slot_value) = find_index(&shard, slot, &key);
+            let (found_index, prev_index, slot_value) = shard.find_index(slot, &key);
 
             if let Some(ifound) = found_index {
                 let entry = &mut shard.entries.get_mut_unchecked(ifound);
-                let next = entry.next.load(Ordering::Acquire); 
-                // XXXXX Bug: `next` could change before the write to slots 
+                let next = entry.next.load(Ordering::Acquire);
+                // XXXXX Bug: `next` could change before the write to slots
                 // XXXXX Need an intermediate step to remove from list?
 
                 // Remove from slot
                 if slot_value == ifound + 1 {
-                    match shard.slots[slot as usize].compare_exchange(
+                    match shard.slots[slot as usize].compare_exchange_weak(
                         slot_value as u16,
                         next,
                         Ordering::AcqRel,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             // success
@@ -392,16 +447,15 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
                             continue;
                         }
                     }
-                }
-                else { 
+                } else {
                     // remove from prev in list
                     let prev_entry = &mut shard.entries.get_mut_unchecked(prev_index.unwrap());
 
-                    match prev_entry.next.compare_exchange(
+                    match prev_entry.next.compare_exchange_weak(
                         (ifound + 1) as u16,
                         next,
                         Ordering::AcqRel,
-                        Ordering::Acquire,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             // success
@@ -419,7 +473,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
                 return result;
             }
 
-            return None // Didnt find
+            return None; // Didnt find
         }
     }
 
@@ -433,7 +487,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
     {
         let (shard_index, slot) = self.calc_index(&key);
         let shard = &self.shards[shard_index];
-        let (found_index, _, _) = find_index(&shard, slot, &key);
+        let (found_index, _, _) = shard.find_index(slot, &key);
 
         if let Some(index) = found_index {
             let entry = &mut shard.entries.get_mut_unchecked(index);
@@ -505,7 +559,7 @@ mod tests {
     #[test]
     fn test_multithreaded_access() {
         const NUM_THREADS: usize = 100;
-        const NUM_KEYS_PER_THREAD: usize = 1000;
+        const NUM_KEYS_PER_THREAD: usize = 10000;
 
         let map = Arc::new(
             BFixMap::<usize, usize, RandomState>::with_capacity_and_hasher(
