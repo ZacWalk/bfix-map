@@ -40,5 +40,49 @@ fn bench_read_95(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_insert, bench_read_95); 
+fn bench_read_100_large(c: &mut Criterion) {
+    const NUM_KEYS: usize = 1_000_000; 
+    const NUM_READS: usize = 100;
+
+    let map = BFixMap::<usize, usize, ahash::RandomState>::with_capacity(NUM_KEYS);
+
+    for i in 0..NUM_KEYS {
+        map.insert(i, i);
+    }
+
+    let mut rng = rand::thread_rng();
+
+    c.bench_function("read_100_large_collection", |b| {
+        b.iter(|| {
+            for _ in 0..NUM_READS {
+                let key = rng.gen_range(0..NUM_KEYS);
+                map.get(&black_box(key));
+            }
+        })
+    });
+}
+
+fn bench_read_100_small(c: &mut Criterion) {
+    const NUM_KEYS: usize = 10_000; 
+    const NUM_READS: usize = 100;
+
+    let map = BFixMap::<usize, usize, ahash::RandomState>::with_capacity(NUM_KEYS);
+
+    for i in 0..NUM_KEYS {
+        map.insert(i, i);
+    }
+
+    let mut rng = rand::thread_rng();
+
+    c.bench_function("read_100_small_collection", |b| {
+        b.iter(|| {
+            for _ in 0..NUM_READS {
+                let key = rng.gen_range(0..NUM_KEYS);
+                map.get(&black_box(key));
+            }
+        })
+    });
+}
+
+criterion_group!(benches, bench_insert, bench_read_95, bench_read_100_large, bench_read_100_small);
 criterion_main!(benches);
