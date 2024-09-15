@@ -1,9 +1,12 @@
-use std::arch::x86_64::*;
+use std::arch::x86_64::{
+    __m128i, _mm_cmpeq_epi8, _mm_cvtsi128_si32, _mm_load_si128, _mm_movemask_epi8, _mm_set1_epi8,
+};
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
+use std::mem;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicUsize, Ordering};
-use std::{array, mem};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 
 fn next_power_of_2_min_256(value: usize) -> usize {
     let value = value.max(256);
@@ -15,87 +18,122 @@ fn next_power_of_2_min_256(value: usize) -> usize {
     return 1 << (usize::BITS - value.leading_zeros());
 }
 
-const SHARD_BITS: usize = 10;
+const SHARD_BITS: usize = 12;
 const SHARD_CAPACITY: usize = 1 << SHARD_BITS;
 const SHARD_MASK: u64 = (SHARD_CAPACITY - 1) as u64;
-const SHARD_PROBE_BLOCK: usize = 16;
-const SHARD_SLOT_MASK: u64 = !0u64 << 4;
+const SHARD_BLOCK_BITS: usize = 4;
+const SHARD_BLOCK_SIZE: usize = 1 << SHARD_BLOCK_BITS;
+const SHARD_SLOT_MASK: u64 = !0u64 << SHARD_BLOCK_BITS;
+const BLOCKS_PER_SHARD: usize = SHARD_CAPACITY / SHARD_BLOCK_SIZE;
 
 #[repr(align(32))]
 struct Shard<K: Hash + Eq + Default + Clone, V: Clone + Default> {
-    index: [u8; SHARD_CAPACITY],
-    data: [(K, V); SHARD_CAPACITY],
+    index: Vec<u8>,
+    data: Vec<(K, V)>,
+    shard_capacity: usize,
 }
 
 impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
-    fn new() -> Self {
+    fn new(block_count: usize) -> Self {
+        let shard_capacity = SHARD_BLOCK_SIZE * block_count;
         Self {
-            index: [0; SHARD_CAPACITY],
-            data: array::from_fn(|_| (K::default(), V::default())),
+            index: vec![0; shard_capacity],
+            data: (0..shard_capacity)
+                .map(|_| (K::default(), V::default()))
+                .collect(),
+            shard_capacity,
         }
     }
 
     #[inline]
-    pub fn get<Q>(&self, start: usize, kh: u8, key: &Q) -> Option<V>
+    fn scan_block(&self, block_index: usize, kh: u8) -> (u32, i32) {
+        let match_vec = unsafe { _mm_set1_epi8(kh as i8) };
+        let index_block = unsafe {
+            _mm_load_si128(self.index.as_ptr().offset(block_index as isize) as *const __m128i)
+        };
+        let found_mask =
+            unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(match_vec, index_block)) } as u32;
+
+        let metadata = unsafe { _mm_cvtsi128_si32(index_block) } & 0xFF;
+
+        (found_mask, metadata)
+    }
+
+    #[inline]
+    pub fn get<'a, Q>(&'a self, start: usize, kh: u8, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        unsafe {
-            let mut block_index = start;
-            //let match_vec = _mm256_set1_epi8(kh as i8);
-            let match_vec = _mm_set1_epi8(kh as i8);
+        let mut block_index = start;
+        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
-            debug_assert!(self.index.as_ptr() as usize % 32 == 0, "Index not alligned to 32 bytes {:x}", self.index.as_ptr() as usize);
+        for _ in 0..blocks_per_shard {
+            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let bi = block_index as usize;
 
-            for _ in 0..SHARD_CAPACITY / SHARD_PROBE_BLOCK {
-                // let entries = _mm256_load_si256(self.index.as_ptr().offset(min as isize) as *const __m256i);
-                // let found_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(match_vec, entries));
-
-                let entries = _mm_load_si128(self.index.as_ptr().offset(block_index as isize) as *const __m128i);
-                let found_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(match_vec, entries));
-
-                for i in 1..SHARD_PROBE_BLOCK {
-                    // bits set represent a possible match
-                    if (found_mask & (1 << i)) != 0 {
-                        if self.data[block_index + i].0.borrow() == key {
-                            return Some(self.data[block_index + i].1.clone());
-                        }
-                    }
+            for i in 1..16 {
+                let (k, v) = unsafe { self.data.get_unchecked(bi + i) };
+                if found_mask & (0x1 << i) != 0 && key == k.borrow() {
+                    return Some(&v);
                 }
-
-                // let max = min + SHARD_PROBE_BLOCK;
-
-                // for i in min + 1..max {
-                //     if self.index[i] == kh {
-                //         // Potential match in the index, check the key in data
-                //         if self.data[i].0.borrow() == key {
-                //             return Some(self.data[i].1.clone()); // Return a clone of the value
-                //         }
-                //     }
-                // }
-
-                // no overflow marker
-                if self.index[block_index] != 0xFF                
-                {
-                    break;
-                }
-
-                block_index = (block_index + SHARD_PROBE_BLOCK) & SHARD_MASK as usize;
             }
 
-            None // No match found
+            // no overflow marker
+            if metadata != 0xFF {
+                break;
+            }
+
+            block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
         }
+
+        None // No match found
+    }
+
+    #[inline]
+    pub fn get_mut<'a, Q>(&'a mut self, start: usize, kh: u8, key: &Q) -> Option<&'a mut V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let mut block_index = start;
+        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+
+        for _ in 0..blocks_per_shard {
+            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let bi = block_index as usize;
+
+            for i in 1..16 {
+                if found_mask & (0x1 << i) != 0 {
+                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
+                    let is_march = key == k.borrow();
+
+                    if is_march {
+                        let (_, v) = unsafe { self.data.get_unchecked_mut(bi + i) };
+                        return Some(v);
+                    }
+                }
+            }
+
+            if metadata != 0xFF {
+                break;
+            }
+
+            block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
+        }
+
+        None
     }
 
     pub fn insert(&mut self, start: usize, kh: u8, key: K, value: V) -> Option<V> {
-        let mut block_start = start;
+        let mut block_index = start;
+        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
-        for _ in 0..SHARD_CAPACITY / SHARD_PROBE_BLOCK {
-            if self.index[block_start] != 0xFF {
-                let block_end = block_start + SHARD_PROBE_BLOCK;
+        for _ in 0..blocks_per_shard {
+            if self.index[block_index] != 0xFF {
+                let block_end = block_index + SHARD_BLOCK_SIZE;
 
-                for i in block_start + 1..block_end {
+                for i in block_index + 1..block_end {
                     if self.index[i] == 0 {
                         // Found an empty slot
                         self.index[i] = kh;
@@ -108,9 +146,44 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
                 }
 
                 // no room - move to next
-                self.index[block_start] = 0xFF; // set overflow marker                
+                self.index[block_index] = 0xFF; // set overflow marker
             }
-            block_start = (block_start + SHARD_PROBE_BLOCK) & SHARD_MASK as usize;
+            block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
+        }
+
+        None
+    }
+
+    pub fn remove<Q>(&mut self, start: usize, kh: u8, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let mut block_index = start;
+        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+
+        for _ in 0..blocks_per_shard {
+            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let bi = block_index as usize;
+
+            for i in 1..16 {
+                if found_mask & (0x1 << i) != 0 {
+                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
+                    let is_march = key == k.borrow();
+
+                    if is_march {
+                        self.index[bi + i] = 0;
+                        let entry = unsafe { self.data.get_unchecked_mut(bi + i) };
+                        return Some(mem::replace(entry, (K::default(), V::default())));
+                    }
+                }
+            }
+
+            if metadata != 0xFF {
+                break;
+            }
+
+            block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
         }
 
         None
@@ -120,6 +193,46 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
 const SHARD_EMPTY: usize = 0;
 const SHARD_LOCKED: usize = 1;
 
+/// A scoped lock for a shard pointer, ensuring it's unlocked when dropped.
+struct shard_lock<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> {
+    shard_ptr_raw: &'a AtomicPtr<Shard<K, V>>,
+    original_ptr: *mut Shard<K, V>,
+}
+
+impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> shard_lock<'a, K, V> {
+    fn new(shard_ptr_raw: &'a AtomicPtr<Shard<K, V>>, original_ptr: *mut Shard<K, V>) -> Self {
+        return Self {
+            shard_ptr_raw,
+            original_ptr,
+        };
+    }
+}
+
+impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> Drop for shard_lock<'a, K, V> {
+    fn drop(&mut self) {
+        // Restore the original pointer when the lock is dropped
+        self.shard_ptr_raw
+            .store(self.original_ptr, Ordering::Release);
+    }
+}
+
+impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::Deref
+    for shard_lock<'a, K, V>
+{
+    type Target = Shard<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.original_ptr }
+    }
+}
+
+impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::DerefMut
+    for shard_lock<'a, K, V>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.original_ptr }
+    }
+}
 
 /// A concurrent hash map with bucket-level fine-grained locking.
 ///
@@ -137,27 +250,62 @@ const SHARD_LOCKED: usize = 1;
 /// * `K`: The type of keys stored in the map. Must implement `Hash` and `Eq`.
 /// * `V`: The type of values stored in the map. Must implement `Clone`.
 /// * `S`: The type of build hasher used for hashing keys. Defaults to `RandomState`.
+#[repr(align(32))]
 pub struct BFixMap<
     K: Hash + Eq + Default + Clone,
     V: Clone + Default,
-    S: BuildHasher + Default = RandomState,
+    S: BuildHasher + Default + Clone = RandomState,
 > {
-    shards: Vec<AtomicPtr<Shard<K, V>>>,
+    //shards: *mut AtomicPtr<Shard<K, V>>,
+    shards: Arc<Box<[AtomicPtr<Shard<K, V>>]>>,
     build_hasher: S,
     shard_count: usize,
 }
 
-impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Default>
+unsafe impl<K, V, S> Send for BFixMap<K, V, S>
+where
+    K: Hash + Eq + Default + Clone + Send,
+    V: Clone + Default + Send,
+    S: BuildHasher + Default + Clone + Send,
+    Shard<K, V>: Send,
+{
+    // No implementation needed, as it's automatically derived if the conditions are met
+}
+
+unsafe impl<K, V, S> Sync for BFixMap<K, V, S>
+where
+    K: Hash + Eq + Default + Clone + Sync,
+    V: Clone + Default + Sync,
+    S: BuildHasher + Default + Clone + Sync,
+    Shard<K, V>: Sync,
+{
+    // No implementation needed, as it's automatically derived if the conditions are met
+}
+
+impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Default + Clone> Clone
+    for BFixMap<K, V, S>
+{
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            build_hasher: self.build_hasher.clone(),
+            shard_count: self.shard_count,
+        }
+    }
+}
+
+impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Default + Clone>
     BFixMap<K, V, S>
 {
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> Self {
-        let shard_count = next_power_of_2_min_256(capacity / (SHARD_CAPACITY / 2));
-        let shards: Vec<AtomicPtr<Shard<K, V>>> = (0..shard_count)
+        let shard_count = next_power_of_2_min_256(2 * capacity / SHARD_CAPACITY);
+        let shard_ptrs: Vec<_> = (0..shard_count)
             .map(|_| AtomicPtr::new(null_mut()))
             .collect();
+        let shards = Arc::new(shard_ptrs.into_boxed_slice());
 
         Self {
-            shards: shards,
+            shards,
             build_hasher,
             shard_count,
         }
@@ -185,29 +333,20 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         )
     }
 
-    /// Retrieves the value associated with the given key, if it exists.
+    /// Retrieves the value associated with the given key from the appropriate shard,
+    /// applying the provided reader function to the value if found.
     #[inline]
-    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    pub fn get<Q, R, F>(&self, key: &Q, reader: F) -> Option<R>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
+        F: FnOnce(&V) -> R,
     {
         let (shard_index, slot, kh) = self.calc_index(&key);
 
-        loop {
-            let shard_ptr = self.shards[shard_index].load(Ordering::Relaxed);
-            let shard_ptr_usize = shard_ptr as usize;
-
-            if shard_ptr_usize == SHARD_EMPTY {
-                return None;
-            } else if shard_ptr_usize == SHARD_LOCKED {
-                // Shard locked, spin
-                std::thread::yield_now();
-                continue;
-            } else {
-                let shard = unsafe { &*shard_ptr };
-                return shard.get(slot, kh, key);
-            }
+        match self.load_shard_ptr(shard_index) {
+            Some(shard) => shard.get(slot, kh, key).map(|v| reader(v)),
+            None => None,
         }
     }
 
@@ -218,12 +357,80 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let (shard_index, slot, kh) = self.calc_index(&key);
 
+        if let Some(mut shard) = self.load_mut_shard_ptr(shard_index, true) {
+            return shard.insert(slot, kh, key, value);
+        }
+
+        None
+    }
+
+    /// Retrieves the value associated with the given key from the appropriate shard,
+    /// allowing modification through the provided closure if found.
+    pub fn modify<Q, R, F>(&self, key: &Q, mutator: F) -> Option<R>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+        F: FnOnce(&mut V) -> R,
+    {
+        let (shard_index, slot, kh) = self.calc_index(key);
+
+        if let Some(mut shard) = self.load_mut_shard_ptr(shard_index, false) {
+            if let Some(v) = shard.get_mut(slot, kh, key) {
+                return Some(mutator(v));
+            }
+        }
+        None
+    }
+
+    /// Retrieves the value associated with the given key from the appropriate shard,
+    /// allowing modification through the provided closure if found.
+    pub fn remove<Q>(&self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let (shard_index, slot, kh) = self.calc_index(key);
+
+        match self.load_mut_shard_ptr(shard_index, false) {
+            Some(mut shard) => shard.remove(slot, kh, key),
+            None => None,
+        }
+    }
+
+    fn load_shard_ptr(&self, shard_index: usize) -> Option<&Shard<K, V>> {
         loop {
-            let shard_ptr = self.shards[shard_index].load(Ordering::Relaxed);
+            let shard_ptr_raw = unsafe { self.shards.get_unchecked(shard_index) };
+            let shard_ptr = shard_ptr_raw.load(Ordering::Relaxed);
             let shard_ptr_usize = shard_ptr as usize;
 
+            if shard_ptr_usize == SHARD_EMPTY {
+                return None;
+            } else if shard_ptr_usize == SHARD_LOCKED {
+                // Shard locked, spin
+                std::thread::yield_now();
+                continue;
+            } else {
+                return Some(unsafe { &mut *shard_ptr });
+            }
+        }
+    }
+
+    fn load_mut_shard_ptr(
+        &self,
+        shard_index: usize,
+        can_create: bool,
+    ) -> Option<shard_lock<'_, K, V>> {
+        loop {
+            let shard_ptr_raw = unsafe { &mut self.shards.get_unchecked(shard_index) };
+            let shard_ptr = shard_ptr_raw.load(Ordering::Relaxed);
+            let shard_ptr_usize = shard_ptr as usize;
+
+            if !can_create && shard_ptr_usize == SHARD_EMPTY {
+                return None;
+            };
+
             if shard_ptr_usize != SHARD_LOCKED {
-                let lock_result = self.shards[shard_index].compare_exchange_weak(
+                let lock_result = shard_ptr_raw.compare_exchange_weak(
                     shard_ptr,
                     SHARD_LOCKED as *mut Shard<K, V>,
                     Ordering::AcqRel,
@@ -233,15 +440,12 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
                 if lock_result.is_ok() {
                     // Successfully locked
                     if shard_ptr_usize == SHARD_EMPTY {
-                        let new_shard_ptr = Box::into_raw(Box::new(Shard::<K, V>::new()));
-                        unsafe { &mut *new_shard_ptr }.insert(slot, kh, key, value);
-                        self.shards[shard_index].store(new_shard_ptr, Ordering::Release);
-                        return None;
+                        let new_shard_ptr =
+                            Box::into_raw(Box::new(Shard::<K, V>::new(BLOCKS_PER_SHARD)));
+                        return Some(shard_lock::new(shard_ptr_raw, new_shard_ptr));
                     } else {
                         let shard = unsafe { &mut *shard_ptr };
-                        let result = shard.insert(slot, kh, key, value);
-                        self.shards[shard_index].store(shard_ptr, Ordering::Release);
-                        return result;
+                        return Some(shard_lock::new(shard_ptr_raw, shard_ptr));
                     }
                 }
             }
@@ -254,7 +458,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
 
 #[cfg(test)]
 mod tests {
-    use std::{hash::RandomState, sync::Arc, thread};
+    use std::{hash::RandomState, thread};
 
     use super::*;
 
@@ -266,28 +470,41 @@ mod tests {
         // Insert
         assert_eq!(map.insert("one".to_string(), 1), None);
         assert_eq!(map.insert("two".to_string(), 2), None);
+        assert_eq!(map.insert("x".to_string(), 3), None);
 
         // Get
-        assert_eq!(map.get(&"one".to_string()), Some(1));
-        assert_eq!(map.get(&"two".to_string()), Some(2));
-        assert_eq!(map.get(&"three".to_string()), None);
+        assert_eq!(map.get("one", |v| v.clone()), Some(1));
+        assert_eq!(map.get("x", |v| v.clone()), Some(3));
+        assert_eq!(map.get(&"two".to_string(), |v| v.clone()), Some(2));
+        assert_eq!(map.get("three", |v| v.clone()), None);
 
-        // // Modify
-        // assert_eq!(map.modify(&"one".to_string(), |v| *v += 1), true);
-        // assert_eq!(map.get(&"one".to_string()), Some(2));
-        // assert_eq!(map.modify(&"three".to_string(), |v| *v += 1), false);
+        // Modify
+        assert_eq!(
+            map.modify("one", |v| {
+                *v += 1;
+                *v
+            }),
+            Some(2)
+        );
+        assert_eq!(map.get("one", |v| v.clone()), Some(2));
+        assert_eq!(
+            map.modify("three", |v| {
+                *v += 1;
+                *v
+            }),
+            None
+        );
 
-        // // // Remove
-        // assert_eq!(map.remove(&"one".to_string()), Some(2));
-        // assert_eq!(map.remove(&"two".to_string()), Some(2));
-        // assert_eq!(map.get(&"one".to_string()), None);
+        assert_eq!(map.remove("one"), Some(("one".to_string(), 2)));
+        assert_eq!(map.remove("two"), Some(("two".to_string(), 2)));
+        assert_eq!(map.get("one", |v| v.clone()), None);
 
         // Insert into deallocated
-        assert_eq!(map.insert("three".to_string(), 1), None);
-        assert_eq!(map.insert("four".to_string(), 2), None);
+        assert_eq!(map.insert("three".to_string(), 11), None);
+        assert_eq!(map.insert("four".to_string(), 22), None);
 
-        assert_eq!(map.get(&"three".to_string()), Some(1));
-        assert_eq!(map.get(&"four".to_string()), Some(2));
+        assert_eq!(map.get("three", |v| v.clone()), Some(11));
+        assert_eq!(map.get("four", |v| v.clone()), Some(22));
     }
 
     #[test]
@@ -306,7 +523,7 @@ mod tests {
 
         // Verify all items are present
         for i in 0..CAPACITY {
-            assert_eq!(map.get(&i), Some(i));
+            assert_eq!(map.get(&i, |v| v.clone()), Some(i));
         }
     }
 
@@ -315,17 +532,15 @@ mod tests {
         const NUM_THREADS: usize = 100;
         const NUM_KEYS_PER_THREAD: usize = 10000;
 
-        let map = Arc::new(
-            BFixMap::<usize, usize, RandomState>::with_capacity_and_hasher(
-                NUM_THREADS * NUM_KEYS_PER_THREAD,
-                RandomState::default(),
-            ),
+        let map = BFixMap::<usize, usize, RandomState>::with_capacity_and_hasher(
+            NUM_THREADS * NUM_KEYS_PER_THREAD,
+            RandomState::default(),
         );
 
         let mut handles = vec![];
 
         for thread_id in 0..NUM_THREADS {
-            let map_clone = Arc::clone(&map);
+            let map_clone = map.clone();
             let handle = thread::spawn(move || {
                 for i in 0..NUM_KEYS_PER_THREAD {
                     let key = thread_id * NUM_KEYS_PER_THREAD + i;
@@ -343,7 +558,7 @@ mod tests {
         for thread_id in 0..NUM_THREADS {
             for i in 0..NUM_KEYS_PER_THREAD {
                 let key = thread_id * NUM_KEYS_PER_THREAD + i;
-                assert_eq!(map.get(&key), Some(key));
+                assert_eq!(map.get(&key, |v| v.clone()), Some(key));
             }
         }
     }

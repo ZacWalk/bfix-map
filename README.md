@@ -30,6 +30,6 @@ The test has the following parameters:
 
 To highlight what a difference NUMA makes, the same test performed on my 16 core i7 shows a completely different result.
 
-![Alt text for the SVG](latency95-local.svg)
+![Alt text for the SVG](latency99-local)
 
 The performance testing [framework is here](https://github.com/ZacWalk/map-bench)

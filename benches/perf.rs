@@ -15,7 +15,7 @@ fn bench_insert(c: &mut Criterion) {
 
 fn bench_read_95(c: &mut Criterion) {
     const NUM_KEYS: usize = 100_000;
-    const NUM_ITERATIONS: usize = 10_000;
+    const NUM_ITERATIONS: usize = 1000;
 
     let map = BFixMap::<usize, usize>::with_capacity(NUM_KEYS);
 
@@ -33,7 +33,7 @@ fn bench_read_95(c: &mut Criterion) {
                 if rng.gen_range(0..100) < 5 { // 5% chance of insert
                     map.insert(black_box(key), black_box(key)); 
                 } else { // 95% chance of read
-                    map.get(&black_box(key));
+                    map.get(&black_box(key), |v| v.clone());
                 }
             }
         })
@@ -42,7 +42,7 @@ fn bench_read_95(c: &mut Criterion) {
 
 fn bench_read_100_large(c: &mut Criterion) {
     const NUM_KEYS: usize = 1_000_000; 
-    const NUM_READS: usize = 100;
+    const NUM_READS: usize = 1000;
 
     let map = BFixMap::<usize, usize, ahash::RandomState>::with_capacity(NUM_KEYS);
 
@@ -56,7 +56,7 @@ fn bench_read_100_large(c: &mut Criterion) {
         b.iter(|| {
             for _ in 0..NUM_READS {
                 let key = rng.gen_range(0..NUM_KEYS);
-                map.get(&black_box(key));
+                map.get(&black_box(key), |v| v.clone());
             }
         })
     });
@@ -64,7 +64,7 @@ fn bench_read_100_large(c: &mut Criterion) {
 
 fn bench_read_100_small(c: &mut Criterion) {
     const NUM_KEYS: usize = 10_000; 
-    const NUM_READS: usize = 100;
+    const NUM_READS: usize = 1000;
 
     let map = BFixMap::<usize, usize, ahash::RandomState>::with_capacity(NUM_KEYS);
 
@@ -78,7 +78,7 @@ fn bench_read_100_small(c: &mut Criterion) {
         b.iter(|| {
             for _ in 0..NUM_READS {
                 let key = rng.gen_range(0..NUM_KEYS);
-                map.get(&black_box(key));
+                map.get(&black_box(key), |v| v.clone());
             }
         })
     });
