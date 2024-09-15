@@ -125,7 +125,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         None
     }
 
-    pub fn insert(&mut self, start: usize, kh: u8, key: K, value: V) -> Option<V> {
+    pub fn insert(&mut self, start: usize, kh: u8, key: K, value: V) -> Result<Option<V>, &'static str> {
         let mut block_index = start;
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
@@ -138,10 +138,10 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
                         // Found an empty slot
                         self.index[i] = kh;
                         self.data[i] = (key, value);
-                        return None;
+                        return Ok(None);
                     } else if self.index[i] == kh && self.data[i].0 == key {
                         // Key already exists, replace the value and return the old one
-                        return Some(mem::replace(&mut self.data[i].1, value));
+                        return Ok(Some(mem::replace(&mut self.data[i].1, value)));
                     }
                 }
 
@@ -151,7 +151,8 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
             block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
         }
 
-        None
+        // Shard is full, return an error
+        Err("Shard is full") 
     }
 
     pub fn remove<Q>(&mut self, start: usize, kh: u8, key: &Q) -> Option<(K, V)>
@@ -237,13 +238,11 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::DerefMut
 /// A concurrent hash map with bucket-level fine-grained locking.
 ///
 /// This map is optimized to provide safe concurrent access for multiple threads, allowing
-/// simultaneous reads and writes without blocking the entire map.
+/// simultaneous reads and writes without blocking the entire map. This map uses simd probing.
 ///
-/// This map has a naive implementation however it turns out to have good performance
-/// with large numbers of threads. The trade-off is that the max number of shards is set at
-/// creation time based on the provided capacity. The collection can grow to contain larger
-/// numbers of items than the specified capacity, but the number of shards does not change.
-/// This design avoids any complex mechanisms around splitting shards.
+/// Currently the trade-off is that the collection capacity is set at creation. If the 
+/// collection grows above that limit inserts will fail. 
+/// I might implement dynamic capacity growth later if needed.
 ///
 /// # Type Parameters
 ///
@@ -354,14 +353,14 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
     ///
     /// If the key already exists, its value is replaced and the old value is returned.
     /// Otherwise, `None` is returned.
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
+    pub fn insert(&self, key: K, value: V) -> Result<Option<V>, &'static str> {
         let (shard_index, slot, kh) = self.calc_index(&key);
 
         if let Some(mut shard) = self.load_mut_shard_ptr(shard_index, true) {
             return shard.insert(slot, kh, key, value);
         }
 
-        None
+        Err("Failed to load shard") 
     }
 
     /// Retrieves the value associated with the given key from the appropriate shard,
@@ -468,9 +467,9 @@ mod tests {
             BFixMap::<String, i32, RandomState>::with_capacity(10);
 
         // Insert
-        assert_eq!(map.insert("one".to_string(), 1), None);
-        assert_eq!(map.insert("two".to_string(), 2), None);
-        assert_eq!(map.insert("x".to_string(), 3), None);
+        assert_eq!(map.insert("one".to_string(), 1).unwrap(), None);
+        assert_eq!(map.insert("two".to_string(), 2).unwrap(), None);
+        assert_eq!(map.insert("x".to_string(), 3).unwrap(), None);
 
         // Get
         assert_eq!(map.get("one", |v| v.clone()), Some(1));
@@ -500,8 +499,8 @@ mod tests {
         assert_eq!(map.get("one", |v| v.clone()), None);
 
         // Insert into deallocated
-        assert_eq!(map.insert("three".to_string(), 11), None);
-        assert_eq!(map.insert("four".to_string(), 22), None);
+        assert_eq!(map.insert("three".to_string(), 11).unwrap(), None);
+        assert_eq!(map.insert("four".to_string(), 22).unwrap(), None);
 
         assert_eq!(map.get("three", |v| v.clone()), Some(11));
         assert_eq!(map.get("four", |v| v.clone()), Some(22));
