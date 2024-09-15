@@ -131,9 +131,10 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
 
         for _ in 0..blocks_per_shard {
 
-            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            // look for existing
+            let (found_mask, _) = self.scan_block(block_index, kh);
             let bi = block_index as usize;
-
+            
             for i in 1..16 {
                 if found_mask & (0x1 << i) != 0 {
                     let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
@@ -142,18 +143,19 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
                     if is_march {
                         let (_, v) = unsafe { self.data.get_unchecked_mut(bi + i) };
                         // Key already exists, replace the value and return the old one
-                        return Ok(Some(mem::replace(&mut self.data[i].1, value)));
+                        return Ok(Some(mem::replace(&mut self.data[bi + i].1, value)));
                     }
                 }
             }
 
-            let block_end = block_index + SHARD_BLOCK_SIZE;
+            // look for empty
+            let (found_mask, _) = self.scan_block(block_index, 0);
 
-            for i in block_index + 1..block_end {
-                if self.index[i] == 0 {
+            for i in 1..16 {
+                if found_mask & (0x1 << i) != 0 {
                     // Found an empty slot
-                    self.index[i] = kh;
-                    self.data[i] = (key, value);
+                    self.index[bi + i] = kh;
+                    self.data[bi + i] = (key, value);
                     return Ok(None);
                 }
             }
