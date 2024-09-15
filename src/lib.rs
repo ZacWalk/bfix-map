@@ -130,24 +130,36 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
         for _ in 0..blocks_per_shard {
-            if self.index[block_index] != 0xFF {
-                let block_end = block_index + SHARD_BLOCK_SIZE;
 
-                for i in block_index + 1..block_end {
-                    if self.index[i] == 0 {
-                        // Found an empty slot
-                        self.index[i] = kh;
-                        self.data[i] = (key, value);
-                        return Ok(None);
-                    } else if self.index[i] == kh && self.data[i].0 == key {
+            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let bi = block_index as usize;
+
+            for i in 1..16 {
+                if found_mask & (0x1 << i) != 0 {
+                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
+                    let is_march = key == *k;
+
+                    if is_march {
+                        let (_, v) = unsafe { self.data.get_unchecked_mut(bi + i) };
                         // Key already exists, replace the value and return the old one
                         return Ok(Some(mem::replace(&mut self.data[i].1, value)));
                     }
                 }
-
-                // no room - move to next
-                self.index[block_index] = 0xFF; // set overflow marker
             }
+
+            let block_end = block_index + SHARD_BLOCK_SIZE;
+
+            for i in block_index + 1..block_end {
+                if self.index[i] == 0 {
+                    // Found an empty slot
+                    self.index[i] = kh;
+                    self.data[i] = (key, value);
+                    return Ok(None);
+                }
+            }
+
+            // no room - move to next
+            self.index[block_index] = 0xFF; // set overflow marker                
             block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
         }
 
