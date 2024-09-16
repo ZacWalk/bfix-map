@@ -46,7 +46,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
     }
 
     #[inline]
-    fn scan_block(&self, block_index: usize, kh: u8) -> (u32, i32) {
+    fn probe_block(&self, block_index: usize, kh: u8) -> (u32, i32) {
         let match_vec = unsafe { _mm_set1_epi8(kh as i8) };
         let index_block = unsafe {
             _mm_load_si128(self.index.as_ptr().offset(block_index as isize) as *const __m128i)
@@ -69,14 +69,22 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, kh);
             let bi = block_index as usize;
 
-            for i in 1..16 {
-                let (k, v) = unsafe { self.data.get_unchecked(bi + i) };
-                if found_mask & (0x1 << i) != 0 && key == k.borrow() {
+            // This loop needs to be written in this unusual way
+            // to allow the compiler to optimise it correctly
+            let mut m = found_mask & !0x1;
+            for _ in 1..16 {
+                let found = m.trailing_zeros();
+                if found == u32::BITS {
+                    break;
+                }
+                let (k, v) = unsafe { self.data.get_unchecked(bi + (found as usize)) };
+                if key == k.borrow() {
                     return Some(&v);
                 }
+                m &= !(1 << found);
             }
 
             // no overflow marker
@@ -100,19 +108,25 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, kh);
             let bi = block_index as usize;
 
-            for i in 1..16 {
-                if found_mask & (0x1 << i) != 0 {
-                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
-                    let is_march = key == k.borrow();
-
-                    if is_march {
-                        let (_, v) = unsafe { self.data.get_unchecked_mut(bi + i) };
-                        return Some(v);
-                    }
+            // This loop needs to be written in this unusual way
+            // to allow the compiler to optimise it correctly
+            let mut m = found_mask & !0x1;
+            for _ in 1..16 {
+                let found = m.trailing_zeros();
+                if found == u32::BITS {
+                    break;
                 }
+                let i = bi + (found as usize);
+                let (k, _) = unsafe { self.data.get_unchecked(i) };
+                let is_match = key == k.borrow();
+                if is_match {
+                    let (_, v) = unsafe { self.data.get_unchecked_mut(i) };
+                    return Some(v);
+                }
+                m &= !(1 << found);
             }
 
             if metadata != 0xFF {
@@ -125,48 +139,59 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         None
     }
 
-    pub fn insert(&mut self, start: usize, kh: u8, key: K, value: V) -> Result<Option<V>, &'static str> {
+    pub fn insert(
+        &mut self,
+        start: usize,
+        kh: u8,
+        key: K,
+        value: V,
+    ) -> Result<Option<V>, &'static str> {
         let mut block_index = start;
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
         for _ in 0..blocks_per_shard {
-
             // look for existing
-            let (found_mask, _) = self.scan_block(block_index, kh);
+            let (found_mask, _) = self.probe_block(block_index, kh);
             let bi = block_index as usize;
-            
-            for i in 1..16 {
-                if found_mask & (0x1 << i) != 0 {
-                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
-                    let is_march = key == *k;
 
-                    if is_march {
-                        let (_, v) = unsafe { self.data.get_unchecked_mut(bi + i) };
-                        // Key already exists, replace the value and return the old one
-                        return Ok(Some(mem::replace(&mut self.data[bi + i].1, value)));
-                    }
+            // This loop needs to be written in this unusual way
+            // to allow the compiler to optimise it correctly
+            let mut m = found_mask & !0x1;
+            for _ in 1..16 {
+                let found = m.trailing_zeros();
+                if found == u32::BITS {
+                    break;
                 }
+                let i = bi + (found as usize);
+                let (k, _) = unsafe { self.data.get_unchecked(i) };
+                let is_match = key == *k;
+                if is_match {
+                    let (_, v) = unsafe { self.data.get_unchecked_mut(i) };
+                    // Key already exists, replace the value and return the old one
+                    return Ok(Some(mem::replace(v, value)));
+                }
+                m &= !(1 << found);
             }
 
             // look for empty
-            let (found_mask, _) = self.scan_block(block_index, 0);
-
-            for i in 1..16 {
-                if found_mask & (0x1 << i) != 0 {
-                    // Found an empty slot
-                    self.index[bi + i] = kh;
-                    self.data[bi + i] = (key, value);
-                    return Ok(None);
-                }
+            let (found_mask, _) = self.probe_block(block_index, 0);
+            let m = found_mask & !0x1;
+            let found = m.trailing_zeros();
+            if found != u32::BITS {
+                let i = bi + (found as usize);
+                // Found an empty slot
+                self.index[i] = kh;
+                self.data[i] = (key, value);
+                return Ok(None);
             }
 
             // no room - move to next
-            self.index[block_index] = 0xFF; // set overflow marker                
+            self.index[block_index] = 0xFF; // set overflow marker
             block_index = (block_index + SHARD_BLOCK_SIZE) & SHARD_MASK as usize;
         }
 
         // Shard is full, return an error
-        Err("Shard is full") 
+        Err("Shard is full")
     }
 
     pub fn remove<Q>(&mut self, start: usize, kh: u8, key: &Q) -> Option<(K, V)>
@@ -178,20 +203,26 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.scan_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, kh);
             let bi = block_index as usize;
 
-            for i in 1..16 {
-                if found_mask & (0x1 << i) != 0 {
-                    let (k, _) = unsafe { self.data.get_unchecked(bi + i) };
-                    let is_march = key == k.borrow();
-
-                    if is_march {
-                        self.index[bi + i] = 0;
-                        let entry = unsafe { self.data.get_unchecked_mut(bi + i) };
-                        return Some(mem::replace(entry, (K::default(), V::default())));
-                    }
+            // This loop needs to be written in this unusual way
+            // to allow the compiler to optimise it correctly
+            let mut m = found_mask & !0x1;
+            for _ in 1..16 {
+                let found = m.trailing_zeros();
+                if found == u32::BITS {
+                    break;
                 }
+                let i = bi + (found as usize);
+                let (k, _) = unsafe { self.data.get_unchecked(i) };
+                let is_match = key == k.borrow();
+                if is_match {
+                    self.index[i] = 0;
+                    let entry = unsafe { self.data.get_unchecked_mut(i) };
+                    return Some(mem::replace(entry, (K::default(), V::default())));
+                }
+                m &= !(1 << found);
             }
 
             if metadata != 0xFF {
@@ -254,8 +285,8 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::DerefMut
 /// This map is optimized to provide safe concurrent access for multiple threads, allowing
 /// simultaneous reads and writes without blocking the entire map. This map uses simd probing.
 ///
-/// Currently the trade-off is that the collection capacity is set at creation. If the 
-/// collection grows above that limit inserts will fail. 
+/// Currently the trade-off is that the collection capacity is set at creation. If the
+/// collection grows above that limit inserts will fail.
 /// I might implement dynamic capacity growth later if needed.
 ///
 /// # Type Parameters
@@ -374,7 +405,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
             return shard.insert(slot, kh, key, value);
         }
 
-        Err("Failed to load shard") 
+        Err("Failed to load shard")
     }
 
     /// Retrieves the value associated with the given key from the appropriate shard,
