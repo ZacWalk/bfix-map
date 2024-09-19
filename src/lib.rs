@@ -20,7 +20,7 @@ fn next_power_of_2_min_256(value: usize) -> usize {
     return 1 << (usize::BITS - value.leading_zeros());
 }
 
-const SHARD_BITS: usize = 12;
+const SHARD_BITS: usize = 10;
 const SHARD_CAPACITY: usize = 1 << SHARD_BITS;
 const SHARD_MASK: u64 = (SHARD_CAPACITY - 1) as u64;
 const SHARD_BLOCK_BITS: usize = 4;
