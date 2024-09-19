@@ -1,3 +1,4 @@
+use std::alloc::{alloc, Layout};
 use std::arch::x86_64::{
     __m128i, _mm_cmpeq_epi8, _mm_cvtsi128_si32, _mm_load_si128, _mm_movemask_epi8, _mm_set1_epi8,
 };
@@ -5,6 +6,7 @@ use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::mem;
 use std::ptr::null_mut;
+use std::ptr::write;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Arc;
 
@@ -27,27 +29,44 @@ const SHARD_SLOT_MASK: u64 = !0u64 << SHARD_BLOCK_BITS;
 const BLOCKS_PER_SHARD: usize = SHARD_CAPACITY / SHARD_BLOCK_SIZE;
 
 #[repr(align(32))]
-struct Shard<K: Hash + Eq + Default + Clone, V: Clone + Default> {
-    index: Vec<u8>,
-    data: Vec<(K, V)>,
-    shard_capacity: usize,
+struct Shard<K: Hash + Eq + Default, V: Default> {
+    index: [u8; SHARD_CAPACITY],
+    keys: [K; SHARD_CAPACITY],
+    values: [V; SHARD_CAPACITY],
 }
 
-impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
-    fn new(block_count: usize) -> Self {
-        let shard_capacity = SHARD_BLOCK_SIZE * block_count;
-        Self {
-            index: vec![0; shard_capacity],
-            data: (0..shard_capacity)
-                .map(|_| (K::default(), V::default()))
-                .collect(),
-            shard_capacity,
+impl<K: Hash + Eq + Default, V: Default> Shard<K, V> {
+    fn new() -> *mut Self {
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc(layout) as *mut Self;
+
+            let keys_offset = size_of::<[u8; SHARD_CAPACITY]>();
+            let values_offset = keys_offset + size_of::<[K; SHARD_CAPACITY]>();
+
+            let index_ptr = (ptr as *mut u8);
+            let keys_ptr = (ptr as *mut u8).add(keys_offset) as *mut K;
+            let values_ptr = (ptr as *mut u8).add(values_offset) as *mut V;
+
+            for i in 0..SHARD_CAPACITY {
+                write(index_ptr.add(i), 0u8);
+            }
+
+            for i in 0..SHARD_CAPACITY {
+                write(keys_ptr.add(i), K::default());
+            }
+
+            for i in 0..SHARD_CAPACITY {
+                write(values_ptr.add(i), V::default());
+            }
+
+            ptr
         }
     }
 
-    #[inline]
-    fn probe_block(&self, block_index: usize, kh: u8) -> (u32, i32) {
-        let match_vec = unsafe { _mm_set1_epi8(kh as i8) };
+    #[inline(always)]
+    fn probe_block(&self, block_index: usize, hash8: u8) -> (u32, i32) {
+        let match_vec = unsafe { _mm_set1_epi8(hash8 as i8) };
         let index_block = unsafe {
             _mm_load_si128(self.index.as_ptr().offset(block_index as isize) as *const __m128i)
         };
@@ -59,35 +78,125 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         (found_mask, metadata)
     }
 
-    #[inline]
-    pub fn get<'a, Q>(&'a self, start: usize, kh: u8, key: &Q) -> Option<&'a V>
+    #[inline(always)]
+    pub fn unrolled_search<Q>(&self, bi: usize, found_mask: u32, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let m = found_mask & !0x1;
+
+        // This written in an unrolled way
+        // to allow the compiler to optimise it correctly
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        let m = m & !(1 << found);
+        let found = m.trailing_zeros();
+        if found == u32::BITS {
+            return usize::MAX;
+        }
+        let i = bi + (found as usize);
+        let k = unsafe { self.keys.get_unchecked(i) };
+        if key == k.borrow() {
+            return i;
+        }
+
+        return usize::MAX;
+    }
+
+    #[inline(always)]
+    pub fn get<'a, Q>(&'a self, start: usize, hash8: u8, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let mut block_index = start;
-        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+        let blocks_per_shard = BLOCKS_PER_SHARD;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.probe_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, hash8);
             let bi = block_index as usize;
+            let i = self.unrolled_search(bi, found_mask, key);
 
-            // This loop needs to be written in this unusual way
-            // to allow the compiler to optimise it correctly
-            let mut m = found_mask & !0x1;
-            for _ in 1..16 {
-                let found = m.trailing_zeros();
-                if found == u32::BITS {
-                    break;
-                }
-                let (k, v) = unsafe { self.data.get_unchecked(bi + (found as usize)) };
-                if key == k.borrow() {
-                    return Some(&v);
-                }
-                m &= !(1 << found);
+            if i != usize::MAX {
+                return Some(unsafe { self.values.get_unchecked(i) });
             }
 
-            // no overflow marker
+            // not found if no overflow marker
             if metadata != 0xFF {
                 break;
             }
@@ -99,34 +208,21 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
     }
 
     #[inline]
-    pub fn get_mut<'a, Q>(&'a mut self, start: usize, kh: u8, key: &Q) -> Option<&'a mut V>
+    pub fn get_mut<'a, Q>(&'a mut self, start: usize, hash8: u8, key: &Q) -> Option<&'a mut V>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let mut block_index = start;
-        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+        let blocks_per_shard = BLOCKS_PER_SHARD;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.probe_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, hash8);
             let bi = block_index as usize;
+            let i = self.unrolled_search(bi, found_mask, key);
 
-            // This loop needs to be written in this unusual way
-            // to allow the compiler to optimise it correctly
-            let mut m = found_mask & !0x1;
-            for _ in 1..16 {
-                let found = m.trailing_zeros();
-                if found == u32::BITS {
-                    break;
-                }
-                let i = bi + (found as usize);
-                let (k, _) = unsafe { self.data.get_unchecked(i) };
-                let is_match = key == k.borrow();
-                if is_match {
-                    let (_, v) = unsafe { self.data.get_unchecked_mut(i) };
-                    return Some(v);
-                }
-                m &= !(1 << found);
+            if i != usize::MAX {
+                return Some(unsafe { self.values.get_unchecked_mut(i) });
             }
 
             if metadata != 0xFF {
@@ -142,35 +238,23 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
     pub fn insert(
         &mut self,
         start: usize,
-        kh: u8,
+        hash8: u8,
         key: K,
         value: V,
     ) -> Result<Option<V>, &'static str> {
         let mut block_index = start;
-        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+        let blocks_per_shard = BLOCKS_PER_SHARD;
 
         for _ in 0..blocks_per_shard {
             // look for existing
-            let (found_mask, _) = self.probe_block(block_index, kh);
+            let (found_mask, _) = self.probe_block(block_index, hash8);
             let bi = block_index as usize;
+            let i = self.unrolled_search(bi, found_mask, &key);
 
-            // This loop needs to be written in this unusual way
-            // to allow the compiler to optimise it correctly
-            let mut m = found_mask & !0x1;
-            for _ in 1..16 {
-                let found = m.trailing_zeros();
-                if found == u32::BITS {
-                    break;
-                }
-                let i = bi + (found as usize);
-                let (k, _) = unsafe { self.data.get_unchecked(i) };
-                let is_match = key == *k;
-                if is_match {
-                    let (_, v) = unsafe { self.data.get_unchecked_mut(i) };
-                    // Key already exists, replace the value and return the old one
-                    return Ok(Some(mem::replace(v, value)));
-                }
-                m &= !(1 << found);
+            if i != usize::MAX {
+                let v = unsafe { self.values.get_unchecked_mut(i) };
+                // Key already exists, replace the value and return the old one
+                return Ok(Some(mem::replace(v, value)));
             }
 
             // look for empty
@@ -180,8 +264,9 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
             if found != u32::BITS {
                 let i = bi + (found as usize);
                 // Found an empty slot
-                self.index[i] = kh;
-                self.data[i] = (key, value);
+                self.index[i] = hash8;
+                self.keys[i] = key;
+                self.values[i] = value;
                 return Ok(None);
             }
 
@@ -194,35 +279,26 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default> Shard<K, V> {
         Err("Shard is full")
     }
 
-    pub fn remove<Q>(&mut self, start: usize, kh: u8, key: &Q) -> Option<(K, V)>
+    pub fn remove<Q>(&mut self, start: usize, hash8: u8, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
         let mut block_index = start;
-        let blocks_per_shard = self.shard_capacity / SHARD_BLOCK_SIZE;
+        let blocks_per_shard = BLOCKS_PER_SHARD;
 
         for _ in 0..blocks_per_shard {
-            let (found_mask, metadata) = self.probe_block(block_index, kh);
+            let (found_mask, metadata) = self.probe_block(block_index, hash8);
             let bi = block_index as usize;
+            let i = self.unrolled_search(bi, found_mask, key);
 
-            // This loop needs to be written in this unusual way
-            // to allow the compiler to optimise it correctly
-            let mut m = found_mask & !0x1;
-            for _ in 1..16 {
-                let found = m.trailing_zeros();
-                if found == u32::BITS {
-                    break;
-                }
-                let i = bi + (found as usize);
-                let (k, _) = unsafe { self.data.get_unchecked(i) };
-                let is_match = key == k.borrow();
-                if is_match {
-                    self.index[i] = 0;
-                    let entry = unsafe { self.data.get_unchecked_mut(i) };
-                    return Some(mem::replace(entry, (K::default(), V::default())));
-                }
-                m &= !(1 << found);
+            if i != usize::MAX {
+                self.index[i] = 0;
+                let k = unsafe { self.keys.get_unchecked_mut(i) };
+                let v = unsafe { self.values.get_unchecked_mut(i) };
+                let kk = mem::replace(k, K::default());
+                let vv = mem::replace(v, V::default());
+                return Some((kk, vv));
             }
 
             if metadata != 0xFF {
@@ -240,12 +316,12 @@ const SHARD_EMPTY: usize = 0;
 const SHARD_LOCKED: usize = 1;
 
 /// A scoped lock for a shard pointer, ensuring it's unlocked when dropped.
-struct shard_lock<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> {
+struct shard_lock<'a, K: Hash + Eq + Default, V: Default> {
     shard_ptr_raw: &'a AtomicPtr<Shard<K, V>>,
     original_ptr: *mut Shard<K, V>,
 }
 
-impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> shard_lock<'a, K, V> {
+impl<'a, K: Hash + Eq + Default, V: Default> shard_lock<'a, K, V> {
     fn new(shard_ptr_raw: &'a AtomicPtr<Shard<K, V>>, original_ptr: *mut Shard<K, V>) -> Self {
         return Self {
             shard_ptr_raw,
@@ -254,7 +330,7 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> shard_lock<'a, K, V
     }
 }
 
-impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> Drop for shard_lock<'a, K, V> {
+impl<'a, K: Hash + Eq + Default, V: Default> Drop for shard_lock<'a, K, V> {
     fn drop(&mut self) {
         // Restore the original pointer when the lock is dropped
         self.shard_ptr_raw
@@ -262,9 +338,7 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> Drop for shard_lock
     }
 }
 
-impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::Deref
-    for shard_lock<'a, K, V>
-{
+impl<'a, K: Hash + Eq + Default, V: Default> std::ops::Deref for shard_lock<'a, K, V> {
     type Target = Shard<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -272,9 +346,7 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::Deref
     }
 }
 
-impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::DerefMut
-    for shard_lock<'a, K, V>
-{
+impl<'a, K: Hash + Eq + Default, V: Default> std::ops::DerefMut for shard_lock<'a, K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.original_ptr }
     }
@@ -292,12 +364,12 @@ impl<'a, K: Hash + Eq + Default + Clone, V: Clone + Default> std::ops::DerefMut
 /// # Type Parameters
 ///
 /// * `K`: The type of keys stored in the map. Must implement `Hash` and `Eq`.
-/// * `V`: The type of values stored in the map. Must implement `Clone`.
+/// * `V`: The type of values stored in the map.
 /// * `S`: The type of build hasher used for hashing keys. Defaults to `RandomState`.
 #[repr(align(32))]
 pub struct BFixMap<
-    K: Hash + Eq + Default + Clone,
-    V: Clone + Default,
+    K: Hash + Eq + Default,
+    V: Default,
     S: BuildHasher + Default + Clone = RandomState,
 > {
     //shards: *mut AtomicPtr<Shard<K, V>>,
@@ -308,8 +380,8 @@ pub struct BFixMap<
 
 unsafe impl<K, V, S> Send for BFixMap<K, V, S>
 where
-    K: Hash + Eq + Default + Clone + Send,
-    V: Clone + Default + Send,
+    K: Hash + Eq + Default + Send,
+    V: Default + Send,
     S: BuildHasher + Default + Clone + Send,
     Shard<K, V>: Send,
 {
@@ -318,15 +390,15 @@ where
 
 unsafe impl<K, V, S> Sync for BFixMap<K, V, S>
 where
-    K: Hash + Eq + Default + Clone + Sync,
-    V: Clone + Default + Sync,
+    K: Hash + Eq + Default + Sync,
+    V: Default + Sync,
     S: BuildHasher + Default + Clone + Sync,
     Shard<K, V>: Sync,
 {
     // No implementation needed, as it's automatically derived if the conditions are met
 }
 
-impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Default + Clone> Clone
+impl<K: Hash + Eq + Default, V: Default, S: BuildHasher + Default + Clone> Clone
     for BFixMap<K, V, S>
 {
     fn clone(&self) -> Self {
@@ -338,9 +410,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
     }
 }
 
-impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Default + Clone>
-    BFixMap<K, V, S>
-{
+impl<K: Hash + Eq + Default, V: Default, S: BuildHasher + Default + Clone> BFixMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> Self {
         let shard_count = next_power_of_2_min_256(2 * capacity / SHARD_CAPACITY);
         let shard_ptrs: Vec<_> = (0..shard_count)
@@ -360,7 +430,7 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         Self::with_capacity_and_hasher(capacity, S::default())
     }
 
-    #[inline]
+    #[inline(always)]
     fn calc_index<Q>(&self, key: &Q) -> (usize, usize, u8)
     where
         K: Borrow<Q>,
@@ -373,23 +443,23 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         (
             ((h >> SHARD_BITS) & shard_mask) as usize,
             ((h & SHARD_MASK) & SHARD_SLOT_MASK) as usize,
-            ((h & 0xFF) | 0x80) as u8,
+            ((h & 0xFF).max(1)) as u8,
         )
     }
 
     /// Retrieves the value associated with the given key from the appropriate shard,
     /// applying the provided reader function to the value if found.
-    #[inline]
+    #[inline(always)]
     pub fn get<Q, R, F>(&self, key: &Q, reader: F) -> Option<R>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
         F: FnOnce(&V) -> R,
     {
-        let (shard_index, slot, kh) = self.calc_index(&key);
+        let (shard_index, slot, hash8) = self.calc_index(&key);
 
         match self.load_shard_ptr(shard_index) {
-            Some(shard) => shard.get(slot, kh, key).map(|v| reader(v)),
+            Some(shard) => shard.get(slot, hash8, key).map(|v| reader(v)),
             None => None,
         }
     }
@@ -399,10 +469,10 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
     /// If the key already exists, its value is replaced and the old value is returned.
     /// Otherwise, `None` is returned.
     pub fn insert(&self, key: K, value: V) -> Result<Option<V>, &'static str> {
-        let (shard_index, slot, kh) = self.calc_index(&key);
+        let (shard_index, slot, hash8) = self.calc_index(&key);
 
         if let Some(mut shard) = self.load_mut_shard_ptr(shard_index, true) {
-            return shard.insert(slot, kh, key, value);
+            return shard.insert(slot, hash8, key, value);
         }
 
         Err("Failed to load shard")
@@ -416,10 +486,10 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         Q: Eq + Hash + ?Sized,
         F: FnOnce(&mut V) -> R,
     {
-        let (shard_index, slot, kh) = self.calc_index(key);
+        let (shard_index, slot, hash8) = self.calc_index(key);
 
         if let Some(mut shard) = self.load_mut_shard_ptr(shard_index, false) {
-            if let Some(v) = shard.get_mut(slot, kh, key) {
+            if let Some(v) = shard.get_mut(slot, hash8, key) {
                 return Some(mutator(v));
             }
         }
@@ -433,14 +503,15 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        let (shard_index, slot, kh) = self.calc_index(key);
+        let (shard_index, slot, hash8) = self.calc_index(key);
 
         match self.load_mut_shard_ptr(shard_index, false) {
-            Some(mut shard) => shard.remove(slot, kh, key),
+            Some(mut shard) => shard.remove(slot, hash8, key),
             None => None,
         }
     }
 
+    #[inline(always)]
     fn load_shard_ptr(&self, shard_index: usize) -> Option<&Shard<K, V>> {
         loop {
             let shard_ptr_raw = unsafe { self.shards.get_unchecked(shard_index) };
@@ -484,8 +555,10 @@ impl<K: Hash + Eq + Default + Clone, V: Clone + Default, S: BuildHasher + Defaul
                 if lock_result.is_ok() {
                     // Successfully locked
                     if shard_ptr_usize == SHARD_EMPTY {
-                        let new_shard_ptr =
-                            Box::into_raw(Box::new(Shard::<K, V>::new(BLOCKS_PER_SHARD)));
+                        let new_shard_ptr = Shard::<K, V>::new();
+
+                        // let new_shard_ptr =
+                        //     Box::into_raw(Box::new(Shard::<K, V>::new()));
                         return Some(shard_lock::new(shard_ptr_raw, new_shard_ptr));
                     } else {
                         let shard = unsafe { &mut *shard_ptr };
@@ -511,7 +584,7 @@ mod tests {
         let map: BFixMap<String, i32, RandomState> =
             BFixMap::<String, i32, RandomState>::with_capacity(10);
 
-        // Insert
+        // // Insert
         assert_eq!(map.insert("one".to_string(), 1).unwrap(), None);
         assert_eq!(map.insert("two".to_string(), 2).unwrap(), None);
         assert_eq!(map.insert("x".to_string(), 3).unwrap(), None);
