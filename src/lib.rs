@@ -265,8 +265,10 @@ impl<K: Hash + Eq + Default, V: Default> Shard<K, V> {
                 let i = bi + (found as usize);
                 // Found an empty slot
                 self.index[i] = hash8;
-                self.keys[i] = key;
-                self.values[i] = value;
+                unsafe { std::ptr::write(self.keys.as_mut_ptr().add(i), key) };
+                unsafe { std::ptr::write(self.values.as_mut_ptr().add(i), value) };
+                //self.keys[i] = key;
+                //self.values[i] = value;
                 return Ok(None);
             }
 
@@ -296,8 +298,21 @@ impl<K: Hash + Eq + Default, V: Default> Shard<K, V> {
                 self.index[i] = 0;
                 let k = unsafe { self.keys.get_unchecked_mut(i) };
                 let v = unsafe { self.values.get_unchecked_mut(i) };
-                let kk = mem::replace(k, K::default());
-                let vv = mem::replace(v, V::default());
+                // let kk = mem::replace(k, K::default());                
+                // let vv = mem::replace(v, V::default());
+
+                // Now it's safe to move the values
+                let kk = std::mem::replace(k, K::default());
+                let vv = std::mem::replace(v, V::default());
+
+                // Set the key to uninitialized memory
+                unsafe {
+                    std::ptr::drop_in_place(k); // Drop the old key
+                    std::ptr::write(k, std::mem::MaybeUninit::uninit().assume_init());
+
+                    std::ptr::drop_in_place(v); // Drop the old key
+                    std::ptr::write(v, std::mem::MaybeUninit::uninit().assume_init());
+                }
                 return Some((kk, vv));
             }
 
